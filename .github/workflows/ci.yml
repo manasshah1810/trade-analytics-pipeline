@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+      - name: End-to-end run on generated data (Parquet write + exact count check)
+        run: |
+          python scripts/generate_events.py --out data/raw --pairs 20000 --seed 7 > gen_stats.json
+          python -m pipeline.job --input data/raw --output data/out --as-of 2026-03-31 | tail -1 > job_stats.json
+          python scripts/verify_e2e.py gen_stats.json job_stats.json
+          ls data/out
