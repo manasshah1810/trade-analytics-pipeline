@@ -2,8 +2,8 @@
 
     python scripts/generate_events.py --out data/raw --pairs 100000 --seed 7
 
-Per pair: both sides usually present; some are missing on one side, some amounts differ, and a few events are
-redelivered or malformed. Counts printed at the end are exact, so tests and the README can quote them.
+Per pair: both sides usually present; some are missing on one side, some amounts differ (by a cent, or clearly), and a few
+events are redelivered or malformed. Counts printed at the end are exact, so tests and the README can quote them.
 """
 import argparse
 import json
@@ -23,7 +23,7 @@ def main() -> None:
     os.makedirs(a.out, exist_ok=True)
     handles = [open(os.path.join(a.out, f"events_{i}.jsonl"), "w", encoding="utf-8") for i in range(a.files)]
     start = date(2026, 3, 1)
-    stats = dict(pairs=a.pairs, missing_b=0, amount_diff=0, redelivered=0, malformed=0)
+    stats = dict(pairs=a.pairs, missing_b=0, amount_diff=0, small_diff=0, redelivered=0, malformed=0)
     n = 0
 
     def emit(rec):
@@ -41,8 +41,11 @@ def main() -> None:
             stats["missing_b"] += 1
         else:
             eb = {**base, "eventId": f"b{i}", "side": "B"}
-            if r < 0.06:
+            if r < 0.045:  # one cent off: within the default 0.05 tolerance
                 eb["amount"] = f"{float(amt) + 0.01:.2f}"
+                stats["small_diff"] += 1
+            elif r < 0.06:  # clearly wrong amount (reuses r's band so the random stream, and event counts, are unchanged)
+                eb["amount"] = f"{float(amt) + 5 + (i % 50) * 7.37:.2f}"
                 stats["amount_diff"] += 1
             emit(eb); n += 1
         if rnd.random() < 0.01:

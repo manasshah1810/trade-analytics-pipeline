@@ -36,6 +36,11 @@ def parse_events(raw: DataFrame) -> tuple[DataFrame, DataFrame]:
     return valid, quarantine
 
 
+def quarantine_summary(quarantine: DataFrame) -> DataFrame:
+    """Data-quality view: how many rejected records per reason."""
+    return quarantine.groupBy("reason").agg(F.count("*").alias("records")).orderBy(F.desc("records"), "reason")
+
+
 def dedupe(events: DataFrame) -> DataFrame:
     """At-least-once delivery means repeats. Keep one row per (streamId, eventId)."""
     return events.dropDuplicates(["streamId", "eventId"])
@@ -53,10 +58,59 @@ def exact_reconcile(events: DataFrame) -> tuple[DataFrame, DataFrame]:
     a = ranked.filter("side = 'A'").select(*key, "rn", F.col("eventId").alias("a_event"))
     b = ranked.filter("side = 'B'").select(*key, "rn", F.col("eventId").alias("b_event"))
     matched = a.join(b, key + ["rn"], "inner").drop("rn")
-    used = (matched.select("a_event").withColumnRenamed("a_event", "eventId")
-            .union(matched.select("b_event").withColumnRenamed("b_event", "eventId")))
-    unmatched = events.join(used, "eventId", "left_anti")
+    # event ids are only unique within a stream, so the anti-join must use both columns
+    used = (matched.select("streamId", F.col("a_event").alias("eventId"))
+            .union(matched.select("streamId", F.col("b_event").alias("eventId"))))
+    unmatched = events.join(used, ["streamId", "eventId"], "left_anti")
     return matched, unmatched
+
+
+BREAK_TYPES = ("MISSING_A", "MISSING_B", "CURRENCY_MISMATCH", "DATE_MISMATCH", "AMOUNT_MISMATCH", "WITHIN_TOLERANCE")
+
+
+def classify_breaks(unmatched: DataFrame, tolerance: str = "0.05") -> DataFrame:
+    """Explain each break by pairing leftover A and B lines on reference alone (one-to-one, eventId order).
+
+    A paired line is CURRENCY_MISMATCH, then DATE_MISMATCH, else AMOUNT_MISMATCH (WITHIN_TOLERANCE if the absolute amount
+    difference is at most `tolerance`, which is reported but not treated as a match). An unpaired A line has no counterpart
+    on B (MISSING_B); an unpaired B line is MISSING_A. `exposure` is the amount difference for amount breaks and the line's
+    absolute amount otherwise. One row per break.
+    """
+    w = Window.partitionBy("reference", "side").orderBy("streamId", "eventId")
+    ranked = unmatched.withColumn("rn", F.row_number().over(w))
+
+    def side(s: str, p: str) -> DataFrame:
+        return (ranked.filter(F.col("side") == s)
+                .select("reference", "rn",
+                        F.col("eventId").alias(f"{p}_event"), F.col("amount").alias(f"{p}_amount"),
+                        F.col("currency").alias(f"{p}_ccy"), F.col("trade_date").alias(f"{p}_date")))
+
+    j = side("A", "a").join(side("B", "b"), ["reference", "rn"], "full_outer")
+    diff = F.abs(F.col("b_amount") - F.col("a_amount"))
+    break_type = (F.when(F.col("a_event").isNull(), "MISSING_A")
+                  .when(F.col("b_event").isNull(), "MISSING_B")
+                  .when(F.col("a_ccy") != F.col("b_ccy"), "CURRENCY_MISMATCH")
+                  .when(F.col("a_date") != F.col("b_date"), "DATE_MISMATCH")
+                  .when(diff <= F.lit(tolerance).cast("decimal(19,4)"), "WITHIN_TOLERANCE")
+                  .otherwise("AMOUNT_MISMATCH"))
+    exposure = F.when(F.col("break_type").isin("AMOUNT_MISMATCH", "WITHIN_TOLERANCE"), diff) \
+        .otherwise(F.abs(F.coalesce(F.col("a_amount"), F.col("b_amount"))))
+    return (j.withColumn("break_type", break_type)
+            .withColumn("currency", F.coalesce("a_ccy", "b_ccy"))
+            .withColumn("trade_date", F.coalesce("a_date", "b_date"))
+            .withColumn("exposure", exposure)
+            .select("reference", "break_type", "a_event", "b_event", "a_amount", "b_amount", "currency", "trade_date",
+                    "exposure"))
+
+
+def break_type_summary(spark: SparkSession, breaks: DataFrame) -> DataFrame:
+    """Breaks and exposure per break type and currency (Spark SQL), largest exposure first."""
+    breaks.createOrReplaceTempView("classified_breaks")
+    return spark.sql("""
+        SELECT break_type, currency, COUNT(*) AS breaks, SUM(exposure) AS exposure
+        FROM classified_breaks
+        GROUP BY break_type, currency
+        ORDER BY exposure DESC, break_type, currency""")
 
 
 def daily_break_summary(spark: SparkSession, matched: DataFrame, unmatched: DataFrame) -> DataFrame:

@@ -134,3 +134,95 @@ def test_aging_buckets(spark):
     _, unmatched = T.exact_reconcile(valid(spark, rows))
     got = {r.bucket: r.lines for r in T.aging(unmatched, "2026-03-31").collect()}
     assert got == {"0-1d": 1, "2-7d": 1, "8-30d": 1, "30d+": 1}
+
+
+# ---- regression: event ids are only unique within a stream -----------------------------------------------------
+
+def test_same_event_id_in_another_stream_is_not_dropped_as_matched(spark):
+    rows = [ev(stream="s1", eid="1", side="A"), ev(stream="s1", eid="2", side="B"),   # s1 pairs
+            ev(stream="s2", eid="1", side="A", ref="T9")]                             # s2 shares eventId "1", has no pair
+    matched, unmatched = T.exact_reconcile(valid(spark, rows))
+    assert matched.count() == 1
+    assert [(r.streamId, r.eventId) for r in unmatched.collect()] == [("s2", "1")]
+
+
+# ---- classify_breaks ----------------------------------------------------------------------------------------
+
+def classify(spark, rows, tol="0.05"):
+    _, unmatched = T.exact_reconcile(valid(spark, rows))
+    return {r.reference + "/" + r.break_type: r for r in T.classify_breaks(unmatched, tol).collect()}
+
+
+def test_missing_side_is_classified_by_which_side_is_absent(spark):
+    got = classify(spark, [ev(eid="a1", side="A", ref="T1"), ev(eid="b2", side="B", ref="T2")])
+    assert set(got) == {"T1/MISSING_B", "T2/MISSING_A"}
+    assert got["T1/MISSING_B"].exposure == Decimal("10.0000")
+
+
+def test_amount_mismatch_reports_difference_as_exposure(spark):
+    got = classify(spark, [ev(eid="a1", side="A", amount="100.00"), ev(eid="b1", side="B", amount="112.50")])
+    assert list(got) == ["T1/AMOUNT_MISMATCH"]
+    assert got["T1/AMOUNT_MISMATCH"].exposure == Decimal("12.5000")
+
+
+def test_tolerance_boundary_is_inclusive(spark):
+    on_limit = classify(spark, [ev(eid="a1", side="A", amount="10.00"), ev(eid="b1", side="B", amount="10.05")])
+    over = classify(spark, [ev(eid="a1", side="A", amount="10.00"), ev(eid="b1", side="B", amount="10.06")])
+    assert list(on_limit) == ["T1/WITHIN_TOLERANCE"] and list(over) == ["T1/AMOUNT_MISMATCH"]
+
+
+def test_tolerance_is_configurable_and_symmetric(spark):
+    rows = [ev(eid="a1", side="A", amount="10.00"), ev(eid="b1", side="B", amount="9.00")]
+    assert list(classify(spark, rows, tol="1.00")) == ["T1/WITHIN_TOLERANCE"]
+    assert list(classify(spark, rows, tol="0.99")) == ["T1/AMOUNT_MISMATCH"]
+
+
+def test_currency_beats_date_beats_amount(spark):
+    rows = [ev(eid="a1", side="A", ref="C", ccy="USD", d="2026-03-01", amount="1.00"),
+            ev(eid="b1", side="B", ref="C", ccy="EUR", d="2026-03-02", amount="9.00"),
+            ev(eid="a2", side="A", ref="D", d="2026-03-01", amount="1.00"),
+            ev(eid="b2", side="B", ref="D", d="2026-03-02", amount="9.00")]
+    got = classify(spark, rows)
+    assert set(got) == {"C/CURRENCY_MISMATCH", "D/DATE_MISMATCH"}
+
+
+def test_leftover_duplicates_pair_then_overflow_is_missing(spark):
+    rows = [ev(eid="a1", side="A", amount="5.00"), ev(eid="a2", side="A", amount="6.00"),
+            ev(eid="b1", side="B", amount="7.00")]
+    types = sorted(r.break_type for r in T.classify_breaks(T.exact_reconcile(valid(spark, rows))[1]).collect())
+    assert types == ["AMOUNT_MISMATCH", "MISSING_B"]
+
+
+def test_one_row_per_break_and_no_double_counting(spark):
+    rows = [ev(eid="a1", side="A", ref="T1", amount="1.00"), ev(eid="b1", side="B", ref="T1", amount="2.00"),
+            ev(eid="a2", side="A", ref="T2"), ev(eid="b3", side="B", ref="T3")]
+    _, unmatched = T.exact_reconcile(valid(spark, rows))
+    assert unmatched.count() == 4
+    assert T.classify_breaks(unmatched).count() == 3        # one mismatch (2 lines) + 2 singles
+
+
+def test_no_breaks_gives_empty_report(spark):
+    _, unmatched = T.exact_reconcile(valid(spark, [ev(eid="a1", side="A"), ev(eid="b1", side="B")]))
+    assert T.classify_breaks(unmatched).count() == 0
+
+
+def test_break_type_summary_sums_exposure_per_type_and_currency(spark):
+    rows = [ev(eid="a1", side="A", ref="T1", amount="10.00"), ev(eid="a2", side="A", ref="T2", amount="4.00"),
+            ev(eid="a3", side="A", ref="T3", amount="3.00", ccy="EUR"),
+            ev(eid="a4", side="A", ref="T4", amount="1.00"), ev(eid="b4", side="B", ref="T4", amount="3.50")]
+    _, unmatched = T.exact_reconcile(valid(spark, rows))
+    out = T.break_type_summary(spark, T.classify_breaks(unmatched))
+    got = {(r.break_type, r.currency): (r.breaks, r.exposure) for r in out.collect()}
+    assert got == {("MISSING_B", "USD"): (2, Decimal("14.0000")), ("MISSING_B", "EUR"): (1, Decimal("3.0000")),
+                   ("AMOUNT_MISMATCH", "USD"): (1, Decimal("2.5000"))}
+    exposures = [r.exposure for r in out.collect()]
+    assert exposures == sorted(exposures, reverse=True)
+
+
+# ---- quarantine_summary ------------------------------------------------------------------------------------
+
+def test_quarantine_summary_counts_reasons(spark):
+    rows = [ev(eid="1", amount="x"), ev(eid="2", amount="y"), ev(eid="3", side="Z"), ev(eid="4")]
+    _, q = T.parse_events(raw(spark, rows))
+    got = [(r.reason, r.records) for r in T.quarantine_summary(q).collect()]
+    assert got == [("bad amount", 2), ("bad side", 1)]
